@@ -1,0 +1,26 @@
+# External source checkouts
+upstream/*
+!upstream/.gitkeep
+
+# Workspace-local build toolchain and downloads
+.tools/
+work/
+
+# Experiment output
+experiments/**/target/
+experiments/**/.venv/
+experiments/**/node_modules/
+experiments/**/artifacts/
+
+# Rust build output
+target/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,13 @@
+[package]
+name = "provider-openai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-protocol.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

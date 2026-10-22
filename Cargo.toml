@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "rust/agent-protocol",
+    "rust/agent-store",
+    "rust/agent-policy",
+    "rust/agent-exec",
+    "rust/agent-tools",
+    "rust/provider-openai",
+    "rust/agent-kernel",
+    "rust/agent-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+agent-protocol = { path = "rust/agent-protocol" }
+agent-store = { path = "rust/agent-store" }
+agent-policy = { path = "rust/agent-policy" }
+agent-exec = { path = "rust/agent-exec" }
+agent-tools = { path = "rust/agent-tools" }
+provider-openai = { path = "rust/provider-openai" }
+agent-kernel = { path = "rust/agent-kernel" }
+anyhow = "1.0.103"
+async-trait = "0.1.89"
+chrono = { version = "0.4.43", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5.58", features = ["derive"] }
+futures-util = "0.3.34"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "process", "time", "io-util", "sync"] }
+uuid = { version = "1.20.0", features = ["v4"] }
+
+[profile.dev]
+debug = 1

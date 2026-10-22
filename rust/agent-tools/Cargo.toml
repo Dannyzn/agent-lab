@@ -1,0 +1,11 @@
+[package]
+name = "agent-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-exec.workspace = true
+agent-policy.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-mini"
+version = "0.1.0"
+description = "A small coding-agent kernel derived from observed Codex protocol boundaries"
+requires-python = ">=3.8"
+
+[project.scripts]
+codex-mini = "codex_mini.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["codex_mini*"]
