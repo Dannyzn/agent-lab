@@ -1,0 +1,32 @@
+{
+  "id": "shipping-policies",
+  "prompt": "Implement shipping_cost(weight_grams, zone, subtotal_cents=0) and the shipping CLI from all six authoritative policy documents in policies/. Read each entire document using read_file: north.md, south.md, east.md, west.md, central.md, and islands.md. Each zone has its own base cents, extra-500-gram-block cents, and free-shipping subtotal threshold. Return integer cents. Weight must be a positive int, subtotal a nonnegative int, and bool is invalid for either; reject invalid arguments or unknown zone with ValueError even if shipping would be free. Validate zone without causing TypeError for an unhashable input. For each additional started block beyond the included 500 grams, add the zone rate. At or above the zone threshold shipping is zero. The CLI already parses --zone, --weight-grams and --subtotal-cents; make it print exactly {\"shipping_cents\": integer} and exit nonzero for invalid inputs. Use a rate table in the implementation; capture the numbers as you inspect the documents rather than relying on remembering every long document. Do not change or shorten the policy documents. Only shipping/pricing.py and shipping/cli.py may change. Preserve tests and all other files. Read all six documents and verify the implementation before finishing.",
+  "editable_files": [
+    "shipping/pricing.py",
+    "shipping/cli.py"
+  ],
+  "required_changed_files": [
+    "shipping/pricing.py",
+    "shipping/cli.py"
+  ],
+  "policy_files": [
+    "policies/north.md",
+    "policies/south.md",
+    "policies/east.md",
+    "policies/west.md",
+    "policies/central.md",
+    "policies/islands.md"
+  ],
+  "test_argv": [
+    "python3",
+    "-B",
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-p",
+    "test_*.py"
+  ],
+  "initial_tests_should_pass": false
+}

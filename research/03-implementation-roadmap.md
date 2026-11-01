@@ -41,7 +41,7 @@
 - token budget、tool output 预算与上下文 compaction。
 - 恢复后仍保持 call/result 的一一对应。
 
-证据：`experiments/phase3/RESULT.md`。预算为本地保守估计，压缩为确定性摘录；SIGKILL 不保证子进程清理。下一步补充真实模型的长任务恢复评估。
+证据：`experiments/phase3/RESULT.md`。预算为本地保守估计，压缩为确定性摘录；SIGKILL 不保证子进程清理。已补首轮真实模型的恢复、同会话追加需求和长规格压缩评估，保留失败与对照记录，详见 `experiments/session-eval/RESULT.md`。v0.3.1 改进跨文件证据摘录与续做提示；仍需扩大样本和重复次数。
 
 ## Phase 4：Claude-compatible profile（待做）
 
