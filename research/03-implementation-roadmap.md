@@ -34,12 +34,14 @@
 
 证据：`experiments/phase2/RESULT.md`。当前范围是受人监督的 macOS 使用；Linux、恶意进程组逃逸和对抗性工作区访问仍需后续加强。
 
-## Phase 3：持久化与长任务（待做）
+## Phase 3：持久化与长任务（macOS CLI 已实现并确定性验收）
 
 - 保存完整 canonical rollout，而不只保存公开生命周期事件。
 - resume、crash recovery、turn 恢复和一致性检查。
 - token budget、tool output 预算与上下文 compaction。
 - 恢复后仍保持 call/result 的一一对应。
+
+证据：`experiments/phase3/RESULT.md`。预算为本地保守估计，压缩为确定性摘录；SIGKILL 不保证子进程清理。下一步补充真实模型的长任务恢复评估。
 
 ## Phase 4：Claude-compatible profile（待做）
 

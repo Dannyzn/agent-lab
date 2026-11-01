@@ -5,6 +5,11 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+mod session;
+pub use session::{
+    FinalMessage, PendingTool, Record, SessionJournal, SessionState, TurnState, TurnStatus,
+};
+
 pub struct JsonlEventSink {
     file: Mutex<File>,
 }

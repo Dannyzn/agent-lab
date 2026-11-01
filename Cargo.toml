@@ -5,6 +5,7 @@ members = [
     "rust/agent-policy",
     "rust/agent-exec",
     "rust/agent-sandbox",
+    "rust/agent-context",
     "rust/agent-tools",
     "rust/provider-openai",
     "rust/agent-kernel",
@@ -13,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [workspace.dependencies]
@@ -22,6 +23,7 @@ agent-store = { path = "rust/agent-store" }
 agent-policy = { path = "rust/agent-policy" }
 agent-exec = { path = "rust/agent-exec" }
 agent-sandbox = { path = "rust/agent-sandbox" }
+agent-context = { path = "rust/agent-context" }
 agent-tools = { path = "rust/agent-tools" }
 provider-openai = { path = "rust/provider-openai" }
 agent-kernel = { path = "rust/agent-kernel" }

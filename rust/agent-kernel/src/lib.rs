@@ -1,10 +1,12 @@
+use agent_context::{compact, limit_tool_result, validate_policy};
 use agent_policy::{ApprovalMode, PolicyDecision};
 use agent_protocol::{
-    ApprovalDecision, ApprovalHandler, ApprovalRequest, BoxError, CancellationToken, EventSink,
-    ModelClient, ToolCall, event,
+    ApprovalDecision, ApprovalHandler, ApprovalRequest, BoxError, CancellationToken, ContextPolicy,
+    EventSink, ModelClient, ToolCall, event,
 };
+use agent_store::{Record, SessionJournal, SessionState, TurnStatus};
 use agent_tools::{ToolRegistry, ToolResult};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -17,6 +19,7 @@ pub struct Agent {
     approval_mode: ApprovalMode,
     approvals: Option<Arc<dyn ApprovalHandler>>,
     cancellation: CancellationToken,
+    context_policy: ContextPolicy,
 }
 
 #[derive(Debug)]
@@ -24,6 +27,33 @@ pub struct RunResult {
     pub thread_id: String,
     pub turn_id: String,
     pub final_message: String,
+}
+
+// Both ephemeral and durable runs use the same validated state machine.
+struct Runtime {
+    state: SessionState,
+    journal: Option<Arc<SessionJournal>>,
+}
+
+impl Runtime {
+    fn record(&mut self, record: Record) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal.append(&record)?;
+        }
+        self.state.apply(&record)
+    }
+
+    fn ids(&self) -> Value {
+        json!({"thread_id":self.state.thread_id,"turn_id":self.state.turn.as_ref().expect("active turn").id})
+    }
+
+    fn has_event(&self, kind: &str, item: Option<&str>) -> bool {
+        self.state.events.iter().any(|e| {
+            e["type"] == kind
+                && (kind == "thread.started" || e["turn_id"] == self.ids()["turn_id"])
+                && item.is_none_or(|id| e["item"]["id"] == id)
+        })
+    }
 }
 
 impl Agent {
@@ -40,6 +70,7 @@ impl Agent {
             approval_mode: ApprovalMode::Ask,
             approvals: None,
             cancellation: CancellationToken::default(),
+            context_policy: ContextPolicy::default(),
         }
     }
 
@@ -47,7 +78,6 @@ impl Agent {
         self.max_steps = max_steps;
         self
     }
-
     pub fn with_approvals(
         mut self,
         mode: ApprovalMode,
@@ -57,207 +87,439 @@ impl Agent {
         self.approvals = handler;
         self
     }
-
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
     }
+    pub fn with_context_policy(mut self, policy: ContextPolicy) -> Self {
+        self.context_policy = policy;
+        self
+    }
+
+    pub fn session_capabilities(&self) -> Value {
+        json!({"tools":self.tools.capabilities(),"approval":format!("{:?}",self.approval_mode),"max_steps":self.max_steps})
+    }
 
     pub async fn run(&self, prompt: &str) -> Result<RunResult> {
-        let thread_id = Uuid::new_v4().to_string();
-        let turn_id = Uuid::new_v4().to_string();
-        self.emit("thread.started", json!({"thread_id":thread_id}))?;
-        self.emit(
-            "turn.started",
-            json!({"thread_id":thread_id,"turn_id":turn_id}),
-        )?;
-        match self.run_turn(prompt, &thread_id, &turn_id).await {
-            Ok(final_message) if !self.cancellation.is_cancelled() => {
-                self.emit(
-                    "turn.completed",
-                    json!({"thread_id":thread_id,"turn_id":turn_id}),
-                )?;
-                Ok(RunResult {
-                    thread_id,
-                    turn_id,
-                    final_message,
-                })
+        self.run_session(Some(prompt), None).await
+    }
+
+    /// An interrupted turn resumes without a prompt. A terminal turn accepts a
+    /// new prompt; a completed turn without one returns the recorded answer.
+    pub async fn run_session(
+        &self,
+        prompt: Option<&str>,
+        journal: Option<Arc<SessionJournal>>,
+    ) -> Result<RunResult> {
+        validate_policy(&self.context_policy)?;
+        let mut rt = Runtime {
+            state: match &journal {
+                Some(j) => j.state()?,
+                None => SessionState::default(),
+            },
+            journal,
+        };
+        let resumed = !rt.state.thread_id.is_empty() && rt.state.turn.is_some();
+        if rt.state.thread_id.is_empty() {
+            rt.record(Record::Created {
+                thread_id: Uuid::new_v4().to_string(),
+                workspace: self.tools.capabilities()["workspace"]
+                    .as_str()
+                    .unwrap_or("")
+                    .into(),
+                capabilities: self.session_capabilities(),
+                context_policy: self.context_policy.clone(),
+            })?;
+        }
+        ensure!(
+            rt.state.capabilities == self.session_capabilities(),
+            "resume capability mismatch: workspace, sandbox, allow-list and approval mode must match"
+        );
+        ensure!(
+            rt.state.context_policy == self.context_policy,
+            "resume context policy mismatch"
+        );
+        let running = rt
+            .state
+            .turn
+            .as_ref()
+            .is_some_and(|t| t.status == TurnStatus::Running);
+        ensure!(
+            !(running && prompt.is_some()),
+            "interrupted turn must resume without a new prompt"
+        );
+        ensure!(
+            rt.state.turn.is_some() || prompt.is_some(),
+            "a new session requires a prompt"
+        );
+        if !rt.has_event("thread.started", None) {
+            let payload = json!({"thread_id":rt.state.thread_id});
+            self.emit(&mut rt, "thread.started", payload)?;
+        }
+        if resumed {
+            self.repair_events(&mut rt)?;
+            let payload = rt.ids();
+            self.emit(&mut rt, "session.resumed", payload)?;
+            if running {
+                self.recover(&mut rt)?;
             }
-            result => {
-                if self.cancellation.is_cancelled() {
-                    self.emit(
-                        "turn.cancelled",
-                        json!({"thread_id":thread_id,"turn_id":turn_id}),
-                    )?;
-                    return Err(anyhow!("turn cancelled"));
+        }
+        if !running {
+            if let Some(prompt) = prompt {
+                rt.record(Record::TurnStarted {
+                    turn_id: Uuid::new_v4().to_string(),
+                    prompt: prompt.into(),
+                })?;
+            } else if rt
+                .state
+                .turn
+                .as_ref()
+                .is_some_and(|t| t.status == TurnStatus::Completed)
+            {
+                return self.result(&rt);
+            } else {
+                rt.record(Record::TurnStarted {turn_id:Uuid::new_v4().to_string(),prompt:
+                    "Continue the previous task after interruption. Inspect the current workspace and recorded results first; do not assume prior changes were rolled back.".into()})?;
+            }
+        }
+        if !rt.has_event("turn.started", None) {
+            let payload = rt.ids();
+            self.emit(&mut rt, "turn.started", payload)?;
+        }
+        match self.run_turn(&mut rt).await {
+            Ok(()) if !self.cancellation.is_cancelled() => {
+                rt.record(Record::TurnFinished {
+                    status: TurnStatus::Completed,
+                    error: None,
+                })?;
+                self.repair_events(&mut rt)?;
+                self.result(&rt)
+            }
+            outcome => {
+                let cancelled = self.cancellation.is_cancelled();
+                let error = if cancelled {
+                    anyhow!("turn cancelled")
+                } else {
+                    outcome.expect_err("success handled above")
+                };
+                // Close every announced call before ending a turn. No automatic rollback.
+                while let Some(pending) = rt.state.pending.first().cloned() {
+                    let result = if pending.started {
+                        unknown_result()
+                    } else {
+                        json!({"success":false,"output":"Call was not executed because the turn ended.","cancelled":cancelled})
+                    };
+                    self.finish_tool(&mut rt, &pending.call, result)?;
                 }
-                let error = result.expect_err("successful result handled above");
-                let failure = self.emit(
-                    "turn.failed",
-                    json!({
-                        "thread_id":thread_id,
-                        "turn_id":turn_id,
-                        "error":{"type":"runtime_error","message":error.to_string()}
-                    }),
-                );
-                if let Err(event_error) = failure {
-                    return Err(anyhow!(
-                        "{error}; additionally failed to record error: {event_error}"
-                    ));
-                }
+                rt.record(Record::TurnFinished {
+                    status: if cancelled {
+                        TurnStatus::Cancelled
+                    } else {
+                        TurnStatus::Failed
+                    },
+                    error: Some(error.to_string()),
+                })?;
+                self.repair_events(&mut rt)?;
                 Err(error)
             }
         }
     }
 
-    async fn run_turn(&self, prompt: &str, thread_id: &str, turn_id: &str) -> Result<String> {
-        let mut history = vec![json!({
-            "type":"message",
-            "role":"user",
-            "content":[{"type":"input_text","text":prompt}]
-        })];
-        let tool_specs = self.tools.specs();
-        for _ in 0..self.max_steps {
+    fn result(&self, rt: &Runtime) -> Result<RunResult> {
+        let turn = rt.state.turn.as_ref().expect("active turn");
+        Ok(RunResult {
+            thread_id: rt.state.thread_id.clone(),
+            turn_id: turn.id.clone(),
+            final_message: turn
+                .final_message
+                .as_ref()
+                .ok_or_else(|| anyhow!("final message missing"))?
+                .text
+                .clone(),
+        })
+    }
+
+    fn recover(&self, rt: &mut Runtime) -> Result<()> {
+        // An approval from the previous process is never reusable.
+        let dangling: Vec<_> = rt
+            .state
+            .events
+            .iter()
+            .filter(|e| {
+                e["type"] == "approval.requested"
+                    && e["turn_id"] == rt.ids()["turn_id"]
+                    && !rt.state.events.iter().any(|r| {
+                        r["type"] == "approval.resolved" && r["approval_id"] == e["approval_id"]
+                    })
+            })
+            .map(|e| e["approval_id"].clone())
+            .collect();
+        for id in dangling {
+            let mut payload = rt.ids();
+            payload["approval_id"] = id;
+            payload["decision"] = json!("cancelled");
+            payload["recovered"] = json!(true);
+            self.emit(rt, "approval.resolved", payload)?;
+        }
+        let mut unknown = 0;
+        while let Some(pending) = rt.state.pending.first().filter(|p| p.started).cloned() {
+            self.finish_tool(rt, &pending.call, unknown_result())?;
+            unknown += 1;
+        }
+        // Remaining calls from the same model response may depend on the unknown
+        // side effect. Return them to the model as unexecuted instead of blindly
+        // continuing a stale plan.
+        if rt.state.recovery_required {
+            while let Some(pending) = rt.state.pending.first().cloned() {
+                self.finish_tool(rt, &pending.call, json!({"success":false,"execution_state":"not_executed","output":"Earlier execution in this batch has an unknown outcome. Inspect the workspace before issuing a new plan."}))?;
+            }
+        }
+        let interrupted = rt
+            .state
+            .turn
+            .as_ref()
+            .is_some_and(|t| t.sampling_in_progress);
+        if interrupted {
+            rt.record(Record::SamplingInterrupted)?;
+        }
+        let mut payload = rt.ids();
+        payload["unknown_tool_results"] = json!(unknown);
+        payload["interrupted_sampling"] = json!(interrupted);
+        self.emit(rt, "session.recovered", payload)
+    }
+
+    fn repair_events(&self, rt: &mut Runtime) -> Result<()> {
+        if rt.state.turn.is_none() {
+            return Ok(());
+        }
+        if !rt.has_event("turn.started", None) {
+            let p = rt.ids();
+            self.emit(rt, "turn.started", p)?;
+        }
+        for completed in rt.state.completed_tools.clone() {
+            if !rt.has_event("item.completed", Some(&completed.call.call_id)) {
+                if !rt.has_event("item.started", Some(&completed.call.call_id)) {
+                    self.tool_event(rt, "item.started", &completed.call, None)?;
+                }
+                self.tool_event(
+                    rt,
+                    "item.completed",
+                    &completed.call,
+                    Some(completed.result),
+                )?;
+            }
+        }
+        if let Some(message) = rt.state.turn.as_ref().and_then(|t| t.final_message.clone())
+            && !rt.has_event("item.completed", Some(&message.item_id))
+        {
+            let mut payload = rt.ids();
+            payload["item"] =
+                json!({"id":message.item_id,"type":"agent_message","text":message.text});
+            self.emit(rt, "item.completed", payload)?;
+        }
+        let turn = rt.state.turn.as_ref().expect("active turn");
+        let kind = match turn.status {
+            TurnStatus::Running => return Ok(()),
+            TurnStatus::Completed => "turn.completed",
+            TurnStatus::Failed => "turn.failed",
+            TurnStatus::Cancelled => "turn.cancelled",
+        };
+        if !rt.has_event(kind, None) {
+            let mut payload = rt.ids();
+            if turn.status == TurnStatus::Failed {
+                payload["error"] = json!({"type":"runtime_error","message":turn.error});
+            }
+            self.emit(rt, kind, payload)?;
+        }
+        Ok(())
+    }
+
+    async fn run_turn(&self, rt: &mut Runtime) -> Result<()> {
+        let specs = self.tools.specs();
+        loop {
+            ensure!(!self.cancellation.is_cancelled(), "turn cancelled");
+            if let Some(pending) = rt.state.pending.first().cloned() {
+                ensure!(!pending.started, "unrecovered execution intent");
+                self.execute_call(rt, &pending.call).await?;
+                continue;
+            }
+            if rt
+                .state
+                .turn
+                .as_ref()
+                .expect("active turn")
+                .final_message
+                .is_some()
+            {
+                self.repair_events(rt)?;
+                return Ok(());
+            }
+            ensure!(
+                rt.state.turn.as_ref().expect("active turn").sampling_steps < self.max_steps,
+                "agent exceeded max_steps={}",
+                self.max_steps
+            );
+            if let Some(view) = compact(
+                &rt.state.history,
+                &rt.state.request_history,
+                &specs,
+                &self.context_policy,
+            )? {
+                let mut payload = rt.ids();
+                payload["before_tokens"] = json!(view.before_tokens);
+                payload["after_tokens"] = json!(view.after_tokens);
+                payload["summarized_pairs"] = json!(view.summarized_pairs);
+                rt.record(Record::ContextCompacted {
+                    history: view.history,
+                    canonical_items: rt.state.history.len(),
+                    before_tokens: view.before_tokens,
+                    after_tokens: view.after_tokens,
+                    summarized_pairs: view.summarized_pairs,
+                })?;
+                self.emit(rt, "context.compacted", payload)?;
+            }
+            rt.record(Record::SamplingStarted)?;
             let response = tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => return Err(anyhow!("turn cancelled")),
-                response = self.model.complete(&history, &tool_specs) => response.map_err(boxed_error)?,
+                response = self.model.complete(&rt.state.request_history,&specs) => response.map_err(boxed_error)?,
             };
-            if !response.tool_calls.is_empty() {
-                for call in response.tool_calls {
-                    anyhow::ensure!(!self.cancellation.is_cancelled(), "turn cancelled");
-                    history.push(json!({
-                        "type":"function_call",
-                        "call_id":call.call_id,
-                        "name":call.name,
-                        "arguments":serde_json::to_string(&call.arguments)?
-                    }));
-                    history.push(self.execute_call(thread_id, turn_id, &call).await?);
-                }
-                continue;
-            }
-            let text = response
-                .text
-                .ok_or_else(|| anyhow!("model returned neither tool calls nor final text"))?;
-            self.emit(
-                "item.completed",
-                json!({
-                    "thread_id":thread_id,
-                    "turn_id":turn_id,
-                    "item":{"id":Uuid::new_v4().to_string(),"type":"agent_message","text":text}
-                }),
-            )?;
-            return Ok(text);
+            rt.record(Record::ModelReturned {
+                response,
+                final_item_id: Uuid::new_v4().to_string(),
+            })?;
         }
-        Err(anyhow!("agent exceeded max_steps={}", self.max_steps))
     }
 
-    async fn execute_call(&self, thread_id: &str, turn_id: &str, call: &ToolCall) -> Result<Value> {
-        let item_type = match call.name.as_str() {
-            "exec_command" => "command_execution",
-            "apply_patch" => "file_change",
-            _ => "tool_call",
-        };
-        let item = json!({
-            "id":call.call_id,
-            "type":item_type,
-            "name":call.name,
-            "arguments":call.arguments,
-            "status":"in_progress"
-        });
-        self.emit(
-            "item.started",
-            json!({"thread_id":thread_id,"turn_id":turn_id,"item":item}),
-        )?;
+    async fn execute_call(&self, rt: &mut Runtime, call: &ToolCall) -> Result<()> {
+        if !rt.has_event("item.started", Some(&call.call_id)) {
+            self.tool_event(rt, "item.started", call, None)?;
+        }
         let mut approval_error = None;
-        let result = match self
+        let allowed = match self
             .tools
             .decision(&call.name, &call.arguments, self.approval_mode)
         {
-            PolicyDecision::Deny(reason) => ToolResult::error(format!("policy denied: {reason}")),
-            PolicyDecision::Allow => {
-                self.tools
-                    .execute_cancellable(&call.name, &call.arguments, &self.cancellation)
-                    .await
+            PolicyDecision::Deny(reason) => {
+                self.finish_tool(
+                    rt,
+                    call,
+                    serde_json::to_value(ToolResult::error(format!("policy denied: {reason}")))?,
+                )?;
+                return Ok(());
             }
+            PolicyDecision::Allow => true,
             PolicyDecision::Ask(reason) => {
                 let request = ApprovalRequest {
                     approval_id: Uuid::new_v4().to_string(),
-                    thread_id: thread_id.into(),
-                    turn_id: turn_id.into(),
+                    thread_id: rt.state.thread_id.clone(),
+                    turn_id: rt.state.turn.as_ref().expect("active turn").id.clone(),
                     call_id: call.call_id.clone(),
                     tool: call.name.clone(),
                     arguments: call.arguments.clone(),
                     reason,
                     capabilities: self.tools.capabilities(),
                 };
-                self.emit("approval.requested", serde_json::to_value(&request)?)?;
+                self.emit(rt, "approval.requested", serde_json::to_value(&request)?)?;
                 let decision = match &self.approvals {
                     Some(handler) => tokio::select! {
                         biased;
-                        _ = self.cancellation.cancelled() => {
-                            self.emit("approval.resolved", json!({"thread_id":thread_id,"turn_id":turn_id,"approval_id":request.approval_id,"decision":"cancelled"}))?;
-                            None
-                        },
-                        decision = handler.approve(&request) => Some(match decision {
-                            Ok(decision) => decision,
-                            Err(error) => { approval_error = Some(error.to_string()); ApprovalDecision::Deny }
-                        }),
+                        _ = self.cancellation.cancelled() => None,
+                        decision = handler.approve(&request) => Some(match decision {Ok(d) => d,Err(e) => {approval_error=Some(e.to_string());ApprovalDecision::Deny}}),
                     },
                     None => Some(ApprovalDecision::Deny),
                 };
-                if let Some(decision) = decision {
-                    self.emit("approval.resolved", json!({"thread_id":thread_id,"turn_id":turn_id,"approval_id":request.approval_id,"decision":decision,"error":approval_error}))?;
-                }
-                if decision == Some(ApprovalDecision::Allow) && !self.cancellation.is_cancelled() {
-                    self.tools
-                        .execute_cancellable(&call.name, &call.arguments, &self.cancellation)
-                        .await
-                } else {
-                    ToolResult::error(if decision.is_none() {
-                        "approval cancelled"
-                    } else {
-                        "approval denied"
-                    })
-                }
+                let mut payload = rt.ids();
+                payload["approval_id"] = json!(request.approval_id);
+                payload["decision"] = decision.map_or(json!("cancelled"), |d| json!(d));
+                payload["error"] = json!(approval_error);
+                self.emit(rt, "approval.resolved", payload)?;
+                decision == Some(ApprovalDecision::Allow)
             }
         };
-        self.emit(
-            "item.completed",
-            json!({
-                "thread_id":thread_id,
-                "turn_id":turn_id,
-                "item":{
-                    "id":call.call_id,
-                    "type":item_type,
-                    "name":call.name,
-                    "arguments":call.arguments,
-                    "status":if self.cancellation.is_cancelled() {"cancelled"} else if result.success {"completed"} else {"failed"},
-                    "result":result
-                }
-            }),
-        )?;
+        let result = if allowed && !self.cancellation.is_cancelled() {
+            rt.record(Record::ToolStarted {
+                call_id: call.call_id.clone(),
+            })?; // fsync before side effects.
+            self.tools
+                .execute_cancellable(&call.name, &call.arguments, &self.cancellation)
+                .await
+        } else {
+            ToolResult::error(if self.cancellation.is_cancelled() {
+                "approval cancelled"
+            } else {
+                "approval denied"
+            })
+        };
+        self.finish_tool(rt, call, serde_json::to_value(result)?)?;
         if let Some(error) = approval_error {
             return Err(anyhow!(error));
         }
-        Ok(json!({
-            "type":"function_call_output",
-            "call_id":call.call_id,
-            "output":result.model_output()?
-        }))
+        Ok(())
     }
 
-    fn emit(&self, event_type: &str, payload: Value) -> Result<()> {
-        self.events
-            .emit(&event(event_type, payload))
-            .map_err(boxed_error)
+    fn finish_tool(&self, rt: &mut Runtime, call: &ToolCall, result: Value) -> Result<()> {
+        if !rt.has_event("item.started", Some(&call.call_id)) {
+            self.tool_event(rt, "item.started", call, None)?;
+        }
+        let model_output = limit_tool_result(&result, self.context_policy.tool_output_bytes)?;
+        rt.record(Record::ToolFinished {
+            call_id: call.call_id.clone(),
+            result: result.clone(),
+            model_output,
+        })?;
+        self.tool_event(rt, "item.completed", call, Some(result))
     }
+
+    fn tool_event(
+        &self,
+        rt: &mut Runtime,
+        kind: &str,
+        call: &ToolCall,
+        result: Option<Value>,
+    ) -> Result<()> {
+        let item_type = match call.name.as_str() {
+            "exec_command" => "command_execution",
+            "apply_patch" => "file_change",
+            _ => "tool_call",
+        };
+        let mut payload = rt.ids();
+        let mut item = json!({"id":call.call_id,"type":item_type,"name":call.name,"arguments":call.arguments,"status":"in_progress"});
+        if let Some(result) = result {
+            item["status"] = json!(if self.cancellation.is_cancelled()
+                || result["cancelled"] == true
+            {
+                "cancelled"
+            } else if result["success"] == true {
+                "completed"
+            } else {
+                "failed"
+            });
+            item["result"] = result;
+        }
+        payload["item"] = item;
+        self.emit(rt, kind, payload)
+    }
+
+    fn emit(&self, rt: &mut Runtime, kind: &str, payload: Value) -> Result<()> {
+        let mut value = event(kind, payload);
+        if rt.journal.is_some() {
+            value["event_id"] = json!(Uuid::new_v4().to_string());
+        }
+        rt.record(Record::Event {
+            event: value.clone(),
+        })?;
+        self.events.emit(&value).map_err(boxed_error)
+    }
+}
+
+fn unknown_result() -> Value {
+    json!({"success":false,"execution_state":"unknown","output":"The process ended after execution intent was saved but before a durable result. This call MUST NOT be replayed automatically. Inspect the workspace before deciding what to do next."})
 }
 
 fn boxed_error(error: BoxError) -> anyhow::Error {
     anyhow!(error.to_string())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,6 +788,242 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_at_durable_boundaries_repairs_events_and_never_resamples_final() {
+        for boundary in ["planned", "started", "result", "final", "terminal"] {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = root.path().join("workspace");
+            fs::create_dir(&workspace).unwrap();
+            fs::write(workspace.join("value.txt"), "original").unwrap();
+            let model = Arc::new(ScriptedModel {
+                responses: Mutex::new(
+                    vec![ModelResponse {
+                        text: Some("done".into()),
+                        ..Default::default()
+                    }]
+                    .into_iter(),
+                ),
+                histories: Mutex::new(Vec::new()),
+            });
+            let events = Arc::new(MemoryEventSink::default());
+            let agent = Agent::new(
+                model.clone(),
+                ToolRegistry::new(
+                    WorkspacePolicy::new(&workspace).unwrap(),
+                    CommandExecutor::default(),
+                ),
+                events.clone(),
+            );
+            let journal = Arc::new(
+                SessionJournal::create(
+                    &root.path().join("session.jsonl"),
+                    Record::Created {
+                        thread_id: "persistent-thread".into(),
+                        workspace: workspace.to_string_lossy().into_owned(),
+                        capabilities: agent.session_capabilities(),
+                        context_policy: ContextPolicy::default(),
+                    },
+                )
+                .unwrap(),
+            );
+            journal
+                .append(&Record::TurnStarted {
+                    turn_id: "persistent-turn".into(),
+                    prompt: "read value".into(),
+                })
+                .unwrap();
+            journal.append(&Record::SamplingStarted).unwrap();
+            let call = ToolCall {
+                call_id: "read-1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"value.txt"}),
+            };
+            journal
+                .append(&Record::ModelReturned {
+                    response: ModelResponse {
+                        tool_calls: vec![call.clone()],
+                        ..Default::default()
+                    },
+                    final_item_id: "unused".into(),
+                })
+                .unwrap();
+            if boundary != "planned" {
+                journal
+                    .append(&Record::ToolStarted {
+                        call_id: call.call_id.clone(),
+                    })
+                    .unwrap();
+            }
+            if ["result", "final", "terminal"].contains(&boundary) {
+                let result = json!({"success":true,"output":"original"});
+                journal
+                    .append(&Record::ToolFinished {
+                        call_id: call.call_id.clone(),
+                        result: result.clone(),
+                        model_output: result.to_string(),
+                    })
+                    .unwrap();
+            }
+            if ["final", "terminal"].contains(&boundary) {
+                journal.append(&Record::SamplingStarted).unwrap();
+                journal
+                    .append(&Record::ModelReturned {
+                        response: ModelResponse {
+                            text: Some("saved answer".into()),
+                            ..Default::default()
+                        },
+                        final_item_id: "final-1".into(),
+                    })
+                    .unwrap();
+            }
+            if boundary == "terminal" {
+                journal
+                    .append(&Record::TurnFinished {
+                        status: TurnStatus::Completed,
+                        error: None,
+                    })
+                    .unwrap();
+            }
+            let result = agent
+                .run_session(None, Some(journal.clone()))
+                .await
+                .unwrap();
+            assert_eq!(result.thread_id, "persistent-thread");
+            assert_eq!(result.turn_id, "persistent-turn");
+            assert_eq!(
+                model.histories.lock().unwrap().len(),
+                if ["final", "terminal"].contains(&boundary) {
+                    0
+                } else {
+                    1
+                }
+            );
+            let state = journal.state().unwrap();
+            agent_context::validate_history(&state.history, false).unwrap();
+            assert_eq!(state.completed_tools.len(), 1);
+            assert_eq!(
+                state.completed_tools[0].result["execution_state"] == "unknown",
+                boundary == "started"
+            );
+            let saved = events.events();
+            assert_eq!(
+                saved
+                    .iter()
+                    .filter(|e| e["type"] == "turn.completed")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                saved.iter().filter(|e| e["type"] == "item.started").count(),
+                1
+            );
+            assert_eq!(
+                saved
+                    .iter()
+                    .filter(|e| e["type"] == "item.completed" && e["item"]["id"] == "read-1")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_barrier_survives_another_crash_before_batch_is_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("value.txt"), "old\n").unwrap();
+        let model = Arc::new(ScriptedModel {
+            responses: Mutex::new(
+                vec![ModelResponse {
+                    text: Some("inspect first".into()),
+                    ..Default::default()
+                }]
+                .into_iter(),
+            ),
+            histories: Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(
+            model.clone(),
+            ToolRegistry::new(
+                WorkspacePolicy::new(&workspace).unwrap(),
+                CommandExecutor::default(),
+            ),
+            Arc::new(MemoryEventSink::default()),
+        )
+        .with_approvals(ApprovalMode::Auto, None);
+        let journal = Arc::new(
+            SessionJournal::create(
+                &root.path().join("session.jsonl"),
+                Record::Created {
+                    thread_id: "t".into(),
+                    workspace: workspace.to_string_lossy().into_owned(),
+                    capabilities: agent.session_capabilities(),
+                    context_policy: ContextPolicy::default(),
+                },
+            )
+            .unwrap(),
+        );
+        journal
+            .append(&Record::TurnStarted {
+                turn_id: "r".into(),
+                prompt: "change".into(),
+            })
+            .unwrap();
+        journal.append(&Record::SamplingStarted).unwrap();
+        let calls = vec![
+            ToolCall {
+                call_id: "first".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"value.txt"}),
+            },
+            ToolCall {
+                call_id: "second".into(),
+                name: "apply_patch".into(),
+                arguments: json!({"patch":"*** Begin Patch\n*** Update File: value.txt\n@@\n-old\n+new\n*** End Patch"}),
+            },
+        ];
+        journal
+            .append(&Record::ModelReturned {
+                response: ModelResponse {
+                    tool_calls: calls,
+                    ..Default::default()
+                },
+                final_item_id: "unused".into(),
+            })
+            .unwrap();
+        journal
+            .append(&Record::ToolStarted {
+                call_id: "first".into(),
+            })
+            .unwrap();
+        let result = unknown_result();
+        journal
+            .append(&Record::ToolFinished {
+                call_id: "first".into(),
+                result: result.clone(),
+                model_output: result.to_string(),
+            })
+            .unwrap();
+        // Simulate another process death exactly after the unknown result was saved.
+        let path = journal.path().to_path_buf();
+        drop(journal);
+        let journal = Arc::new(SessionJournal::open(&path).unwrap());
+        agent
+            .run_session(None, Some(journal.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.join("value.txt")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(
+            journal.state().unwrap().completed_tools[1].result["execution_state"],
+            "not_executed"
+        );
+        assert_eq!(model.histories.lock().unwrap()[0].len(), 5);
     }
 
     fn contract_dir() -> PathBuf {

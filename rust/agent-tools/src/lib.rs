@@ -58,7 +58,7 @@ impl ToolRegistry {
     }
 
     pub fn capabilities(&self) -> Value {
-        json!({"workspace":self.policy.root(), "sandbox":self.executor.sandbox()})
+        json!({"workspace":self.policy.root(), "sandbox":self.executor.sandbox(), "allowed_commands":self.policy.allowed_commands()})
     }
 
     pub fn specs(&self) -> Vec<Value> {

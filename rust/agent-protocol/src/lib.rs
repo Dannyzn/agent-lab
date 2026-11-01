@@ -8,6 +8,26 @@ use std::error::Error;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
+/// Local payload estimates are conservative bytes, not provider billing tokens.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ContextPolicy {
+    pub max_tokens: usize,
+    pub reserve_output_tokens: usize,
+    pub tool_output_bytes: usize,
+    pub keep_recent_pairs: usize,
+}
+
+impl Default for ContextPolicy {
+    fn default() -> Self {
+        Self {
+            max_tokens: 32768,
+            reserve_output_tokens: 4096,
+            tool_output_bytes: 8192,
+            keep_recent_pairs: 2,
+        }
+    }
+}
+
 /// Sticky cancellation: late subscribers also observe a prior cancellation.
 #[derive(Clone, Debug)]
 pub struct CancellationToken(tokio::sync::watch::Sender<bool>);

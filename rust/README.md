@@ -1,6 +1,6 @@
-# Rust runtime v0.2
+# Rust runtime v0.3
 
-`PROTOCOL.md` 的实现，当前支持 macOS。9 个 crate：protocol、store、policy、sandbox、exec、tools、provider-openai、kernel、cli。
+`PROTOCOL.md` 的实现，当前支持 macOS。10 个 crate：protocol、context、store、policy、sandbox、exec、tools、provider-openai、kernel、cli。
 
 ## 构建与检查
 
@@ -13,6 +13,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ./experiments/rust-phase1/run-contract.sh
 ./experiments/phase2/run-contract.sh
+./experiments/phase3/run-contract.sh
 ```
 
 本次实验使用工作区内的工具链与缓存，复现时可先设置：
@@ -61,7 +62,7 @@ Seatbelt 支持文件系统隔离和进程继承；外部文件内容不可读�
 
 也可回传 `deny`。无效或不匹配的回复一律拒绝。Ctrl-C（SIGINT）和 SIGTERM 会取消 turn，关闭正在执行的 item，输出 `turn.cancelled`，以 130 退出。
 
-进程组清理覆盖常规子孙进程；不保证恶意 `setsid`/进程组逃逸。同步文件工具在工具边界观测取消，已落盘修改不自动回滚。当前还没有 resume、crash recovery 或 compaction。
+进程组清理覆盖常规子孙进程；不保证恶意 `setsid`/进程组逃逸。同步文件工具在工具边界观测取消，已落盘修改不自动回滚。会话恢复与上下文预算已实现，详见 [Phase 3 使用说明](../experiments/phase3/README.md)。SIGKILL 不经过取消清理，可能留下工具子进程；恢复不代表旧进程已经终止。
 
 ## 兼容服务与本地配置
 

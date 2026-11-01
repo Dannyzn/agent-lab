@@ -33,3 +33,8 @@ __pycache__/
 /configs/providers/
 /experiments/*-live/
 /scripts/run-provider.py
+
+# Private durable conversations and source-bearing rollout logs
+/sessions/
+*.session.jsonl
+*.rollout.jsonl

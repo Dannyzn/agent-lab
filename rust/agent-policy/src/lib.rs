@@ -63,6 +63,12 @@ impl WorkspacePolicy {
         Ok(policy)
     }
 
+    pub fn allowed_commands(&self) -> Vec<&str> {
+        let mut commands: Vec<_> = self.allowed_commands.iter().map(String::as_str).collect();
+        commands.sort_unstable();
+        commands
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

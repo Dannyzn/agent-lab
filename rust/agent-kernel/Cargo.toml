@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+agent-context.workspace = true
+agent-store.workspace = true
 agent-protocol.workspace = true
 agent-policy.workspace = true
 agent-tools.workspace = true
@@ -15,7 +17,6 @@ tokio.workspace = true
 [dev-dependencies]
 agent-exec.workspace = true
 agent-policy.workspace = true
-agent-store.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 tempfile.workspace = true

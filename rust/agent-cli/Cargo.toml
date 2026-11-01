@@ -8,6 +8,7 @@ name = "our-agent"
 path = "src/main.rs"
 
 [dependencies]
+uuid.workspace = true
 agent-exec.workspace = true
 agent-sandbox.workspace = true
 agent-kernel.workspace = true

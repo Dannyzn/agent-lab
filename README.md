@@ -5,7 +5,7 @@
 - `codex` profile：优先兼容 OpenAI Responses API、Codex 的 thread/turn/event 模型及审批与沙箱行为。
 - `claude` profile：兼容 Anthropic Messages API，以及 Claude Code 的 `CLAUDE.md`、hooks、skills、subagents 和权限模式。
 
-官方 Codex 构建与确定性端到端追踪已经完成。自有 `PROTOCOL.md`、共享 contract tests、Rust Phase 1 纵向闭环及 macOS Phase 2 审批 / Seatbelt / 取消闭环已经完成；官方源码继续作为协议和行为参考，不作为 fork 基线。
+官方 Codex 构建与确定性端到端追踪已经完成。自有 `PROTOCOL.md`、共享 contract tests、Rust Phase 1 纵向闭环、macOS Phase 2 审批 / Seatbelt / 取消闭环及 Phase 3 会话恢复 / 上下文预算已经完成；官方源码继续作为协议和行为参考，不作为 fork 基线。
 
 ## 目录
 
@@ -19,7 +19,7 @@
 
 ## 当前结论
 
-采用“官方实现作行为基线，自有小内核作产品起点”的路线。Rust runtime 目前由 9 个小 crate 组成，已经通过 Responses SSE、工具执行、补丁、复测、JSONL 和 Git diff 的完整离线端到端验收。Claude Code CLI 本体不是开源许可，因此 Claude profile 将采用公开文档与 API 的兼容实现，不复制其受限源码。
+采用“官方实现作行为基线，自有小内核作产品起点”的路线。Rust runtime 目前由 10 个小 crate 组成，已经通过 Responses SSE、工具执行、补丁、复测、JSONL 和 Git diff 的完整离线端到端验收。Claude Code CLI 本体不是开源许可，因此 Claude profile 将采用公开文档与 API 的兼容实现，不复制其受限源码。
 
 继续讨论前请先看：
 
@@ -42,4 +42,14 @@
 - [如何判断 agent 可用：测试指南](research/06-agent-acceptance.md)
 - [单文件修复与多文件任务验收](experiments/agent-eval/RESULT.md)
 
-Phase 2 验证的是运行时与边界。另已完成真实模型的单文件修复和三文件功能任务验收：外部测试通过、保护文件未变，且无被拒绝的审批请求；样本量仍不足以推断通用任务可靠性。具体供应商配置、模型标识、网关地址和原始实测记录仅保留在本地，不纳入版本控制。恢复、compaction 和 Anthropic profile 仍为后续阶段。
+Phase 2 验证的是运行时与边界。另已完成真实模型的单文件修复和三文件功能任务验收：外部测试通过、保护文件未变，且无被拒绝的审批请求；样本量仍不足以推断通用任务可靠性。具体供应商配置、模型标识、网关地址和原始实测记录仅保留在本地，不纳入版本控制。Anthropic profile 仍为后续阶段。
+
+## Phase 3 当前状态（2026-11-01）
+
+新增可选私有会话 WAL、`--session` / `--resume`、崩溃恢复、同一 thread 续做、工具输出预算和确定性上下文摘录压缩。执行前保存意图，结果未知时不自动重跑工具；用户消息与原始工具结果始终保留。恢复会核对原能力和资源预算。
+
+- [使用与恢复语义](experiments/phase3/README.md)
+- [Phase 3 验收与限制](experiments/phase3/RESULT.md)
+- [持久化与上下文设计决策](decisions/0003-durable-session-and-context.md)
+
+本阶段通过确定性崩溃恢复验收。SIGKILL 仍可能遗留子进程，摘录压缩会丢失历史细节；真实模型长任务成功率需要后续专门评估。
