@@ -5,7 +5,11 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+agent-protocol.workspace = true
+agent-sandbox.workspace = true
+libc.workspace = true
 serde.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

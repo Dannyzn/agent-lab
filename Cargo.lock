@@ -4,32 +4,39 @@ version = 4
 
 [[package]]
 name = "agent-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-exec",
  "agent-kernel",
  "agent-policy",
  "agent-protocol",
+ "agent-sandbox",
  "agent-store",
  "agent-tools",
  "anyhow",
+ "async-trait",
  "clap",
  "provider-openai",
+ "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "agent-exec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "agent-protocol",
+ "agent-sandbox",
  "anyhow",
+ "libc",
  "serde",
+ "tempfile",
  "tokio",
 ]
 
 [[package]]
 name = "agent-kernel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-exec",
  "agent-policy",
@@ -47,21 +54,34 @@ dependencies = [
 
 [[package]]
 name = "agent-policy"
-version = "0.1.0"
+version = "0.2.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "agent-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "agent-sandbox"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]
 name = "agent-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-protocol",
  "serde_json",
@@ -70,10 +90,11 @@ dependencies = [
 
 [[package]]
 name = "agent-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-exec",
  "agent-policy",
+ "agent-protocol",
  "anyhow",
  "serde",
  "serde_json",
@@ -871,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "provider-openai"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-protocol",
  "anyhow",

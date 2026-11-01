@@ -1,5 +1,6 @@
 use agent_exec::{CommandExecutor, DEFAULT_MAX_OUTPUT_BYTES, ExecRequest};
-use agent_policy::WorkspacePolicy;
+use agent_policy::{ApprovalMode, PolicyDecision, WorkspacePolicy};
+use agent_protocol::CancellationToken;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -27,7 +28,7 @@ impl ToolResult {
         }
     }
 
-    fn error(error: impl std::fmt::Display) -> Self {
+    pub fn error(error: impl std::fmt::Display) -> Self {
         Self {
             success: false,
             output: error.to_string(),
@@ -44,7 +45,20 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new(policy: WorkspacePolicy, executor: CommandExecutor) -> Self {
+        let executor = if policy.is_read_only() {
+            executor.restrict_read_only()
+        } else {
+            executor
+        };
         Self { policy, executor }
+    }
+
+    pub fn decision(&self, name: &str, arguments: &Value, mode: ApprovalMode) -> PolicyDecision {
+        self.policy.decide(name, arguments, mode)
+    }
+
+    pub fn capabilities(&self) -> Value {
+        json!({"workspace":self.policy.root(), "sandbox":self.executor.sandbox()})
     }
 
     pub fn specs(&self) -> Vec<Value> {
@@ -83,11 +97,24 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, name: &str, arguments: &Value) -> ToolResult {
+        self.execute_cancellable(name, arguments, &CancellationToken::default())
+            .await
+    }
+
+    pub async fn execute_cancellable(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancellation: &CancellationToken,
+    ) -> ToolResult {
+        if cancellation.is_cancelled() {
+            return ToolResult::error("tool cancelled");
+        }
         let result = match name {
             "read_file" => self.read_file(arguments),
             "search" => self.search(arguments),
             "apply_patch" => self.apply_patch(arguments),
-            "exec_command" => self.exec_command(arguments).await,
+            "exec_command" => self.exec_command(arguments, cancellation).await,
             _ => Err(anyhow!("unknown tool: {name}")),
         };
         result.unwrap_or_else(ToolResult::error)
@@ -129,6 +156,7 @@ impl ToolRegistry {
     }
 
     fn apply_patch(&self, arguments: &Value) -> Result<ToolResult> {
+        anyhow::ensure!(!self.policy.is_read_only(), "workspace is read-only");
         let patch = string_argument(arguments, "patch")?;
         let files = apply_update_patch(&self.policy, patch)?;
         Ok(ToolResult::ok(
@@ -137,7 +165,11 @@ impl ToolRegistry {
         ))
     }
 
-    async fn exec_command(&self, arguments: &Value) -> Result<ToolResult> {
+    async fn exec_command(
+        &self,
+        arguments: &Value,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolResult> {
         let argv = arguments
             .get("argv")
             .and_then(Value::as_array)
@@ -160,12 +192,15 @@ impl ToolRegistry {
         }
         let result = self
             .executor
-            .run(ExecRequest {
-                argv,
-                cwd: self.policy.root().to_path_buf(),
-                timeout_ms,
-                max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
-            })
+            .run_cancellable(
+                ExecRequest {
+                    argv,
+                    cwd: self.policy.root().to_path_buf(),
+                    timeout_ms,
+                    max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+                },
+                cancellation,
+            )
             .await?;
         Ok(ToolResult {
             success: result.success,
@@ -174,6 +209,7 @@ impl ToolRegistry {
                 "exit_code":result.exit_code,
                 "elapsed_ms":result.elapsed_ms,
                 "timeout":result.timed_out,
+                "cancelled":result.cancelled,
                 "truncated":result.truncated
             })
             .as_object()
@@ -205,6 +241,9 @@ fn string_argument<'a>(arguments: &'a Value, name: &str) -> Result<&'a str> {
 }
 
 fn collect_files(path: &Path, workspace: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    if path.file_name().is_some_and(|name| name == ".git") {
+        return Ok(());
+    }
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         let resolved = path.canonicalize()?;
@@ -220,9 +259,6 @@ fn collect_files(path: &Path, workspace: &Path, files: &mut Vec<PathBuf>) -> Res
         files.push(path.to_path_buf());
         return Ok(());
     }
-    if path.file_name().is_some_and(|name| name == ".git") {
-        return Ok(());
-    }
     for entry in fs::read_dir(path)? {
         collect_files(&entry?.path(), workspace, files)?;
     }
@@ -230,6 +266,7 @@ fn collect_files(path: &Path, workspace: &Path, files: &mut Vec<PathBuf>) -> Res
 }
 
 pub fn apply_update_patch(policy: &WorkspacePolicy, patch: &str) -> Result<Vec<String>> {
+    anyhow::ensure!(!policy.is_read_only(), "workspace is read-only");
     let lines: Vec<&str> = patch.lines().collect();
     if lines.first() != Some(&"*** Begin Patch") || lines.last() != Some(&"*** End Patch") {
         bail!("patch must use Begin Patch / End Patch markers");

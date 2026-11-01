@@ -8,6 +8,55 @@ use std::error::Error;
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 
+/// Sticky cancellation: late subscribers also observe a prior cancellation.
+#[derive(Clone, Debug)]
+pub struct CancellationToken(tokio::sync::watch::Sender<bool>);
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
+}
+
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    pub async fn cancelled(&self) {
+        let mut receiver = self.0.subscribe();
+        let _ = receiver.wait_for(|cancelled| *cancelled).await;
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ApprovalRequest {
+    pub approval_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: Value,
+    pub reason: String,
+    pub capabilities: Value,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Allow,
+    Deny,
+}
+
+#[async_trait]
+pub trait ApprovalHandler: Send + Sync {
+    async fn approve(&self, request: &ApprovalRequest) -> Result<ApprovalDecision, BoxError>;
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ToolCall {
     pub call_id: String,

@@ -40,6 +40,7 @@ port="$(cat "$server_dir/port.txt")"
 export OPENAI_API_KEY=contract-test-key
 "$lab_root/target/debug/our-agent" \
   --workspace "$run_dir" \
+  --approval auto \
   --base-url "http://127.0.0.1:$port/v1" \
   --model contract-model \
   --json \
@@ -83,6 +84,7 @@ human_port="$(cat "$human_server_dir/port.txt")"
 
 "$lab_root/target/debug/our-agent" \
   --workspace "$human_run_dir" \
+  --approval auto \
   --base-url "http://127.0.0.1:$human_port/v1" \
   --model contract-model \
   --events "$artifact_dir/human-events.jsonl" \

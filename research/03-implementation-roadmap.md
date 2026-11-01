@@ -1,89 +1,55 @@
-# 建议的实现路线
+# 实现路线与当前阶段
+
+更新：2026-11-01。早期 Phase 1 草案中的审批、取消与恢复已按实际依赖拆到 Phase 2 和 Phase 3；以本路线及各阶段 RESULT 为准。
 
 ## 总体策略
 
-构建一个公共内核，外加 `codex` 和 `claude` 两个 profile。profile 负责模型协议、默认工具命名、指令文件和用户体验；内核负责生命周期、工具调度、权限、持久化和事件流。
+构建公共 Rust 内核，以 Provider adapter 和 profile 接入 OpenAI / Anthropic。模型 wire types 不进入工具运行时和存储。官方 Codex 作为固定版本的可执行参考，不作为 fork 基线。
 
-```text
-                  ┌─ OpenAI Responses provider ─ Codex profile
-CLI / app API ─── Agent kernel
-                  └─ Anthropic Messages provider ─ Claude profile
-                           │
-          tools ─ permissions ─ sandbox ─ event store
-```
+## Phase 0：官方行为基线（已完成）
 
-推荐 Rust 作为内核语言。原因是 Codex 的可复用代码、跨平台进程控制和沙箱实现都在 Rust 生态内；长期运行的并发任务、取消和流式事件也适合强类型状态机。应用 UI 将来可以通过 JSONL/JSON-RPC 协议用 TypeScript 实现。
+- 固定上游 commit 并完成源码构建。
+- 真实官方二进制接本地确定性 Responses 服务，完成修复/复测流程。
+- 跟踪 canonical history、function call/output 和 thread/turn/item 事件。
+- 记录 schema、源码规模、构建结果与网络预检边界。
 
-## Phase 0：可运行参考线
+证据：`experiments/codex-source-build/RESULT.md`。
 
-目标是确认我们能从源码构建官方 Codex，并采集一次最小任务的完整事件流。
+## Phase 1：最小纵向闭环（已完成）
 
-交付物：
+- `PROTOCOL.md` 与语言无关 contract。
+- Python 可执行规格和 Rust workspace。
+- Responses HTTP/SSE、4 个工具、完整 history、JSONL、CLI 和 Git diff。
+- 同一 contract 通过 Python、Rust kernel 和真实 Rust CLI 三层验收。
 
-- 固定一个上游 commit，而不是长期跟随浮动的 `main`。
-- 构建 `codex`，运行只读任务和一次文件修改任务。
-- 记录模型请求、tool call、审批、sandbox、rollout 的对应关系。
-- 用 app-server 的 schema 生成命令保存一份版本化协议快照。
+证据：`experiments/rust-phase1/RESULT.md`。
 
-退出条件：团队能从一条用户输入追踪到模型调用、工具执行、持久化和最终事件。
+## Phase 2：审批、OS 沙箱与取消（macOS 已实现并验收）
 
-## Phase 1：最小 Codex-compatible kernel
+- 每次调用的 allow / ask / deny，默认命令与补丁询问。
+- 人类审批和 JSON 双向审批、超时拒绝与唯一 ID 关联。
+- macOS Seatbelt，文件与网络能力、最小环境、工作区与独立临时目录。
+- SIGINT/SIGTERM、sticky cancellation、命令进程组清理及有界输出。
+- 自动验收批准/拒绝、只读、越界、禁网以及不同等待状态下取消。
 
-建议的初始 crate 边界：
+证据：`experiments/phase2/RESULT.md`。当前范围是受人监督的 macOS 使用；Linux、恶意进程组逃逸和对抗性工作区访问仍需后续加强。
 
-```text
-crates/
-  agent-protocol/       thread/turn/item/event 类型
-  agent-kernel/         turn loop、取消、输入队列
-  provider-openai/      Responses API + SSE
-  agent-tools/          registry、router、tool runtime
-  agent-exec/           shell 进程与超时
-  agent-policy/         tool policy 与 approvals
-  agent-store/          append-only JSONL
-  agent-cli/            exec、resume、stream-json
-```
+## Phase 3：持久化与长任务（待做）
 
-第一版工具只有：读文件、搜索、补丁、执行命令。模型发出 tool call 后，系统必须能执行、记录结果、再次调用模型并得到最终消息。
+- 保存完整 canonical rollout，而不只保存公开生命周期事件。
+- resume、crash recovery、turn 恢复和一致性检查。
+- token budget、tool output 预算与上下文 compaction。
+- 恢复后仍保持 call/result 的一一对应。
 
-MVP 验收：
+## Phase 4：Claude-compatible profile（待做）
 
-- `agent exec "修复这个失败测试"` 能在临时 git repo 内完成多轮工具调用。
-- 文件写入范围受 workspace root 限制。
-- 命令可设置超时、取消，并完整收集 stdout/stderr/exit code。
-- 高风险或越界调用会产生结构化 approval request。
-- 进程中断后可以从 JSONL 恢复 session。
-- `--output-format stream-json` 输出稳定的 thread/turn/item 事件。
+- Anthropic Messages streaming 与中立类型映射。
+- `CLAUDE.md` 发现、继承和优先级。
+- Claude 风格工具命名、权限模式及 hooks / skills。
+- MCP 和 subagent 能力。
 
-## Phase 2：安全执行与产品可用性
+## 产品验收与后续平台
 
-- macOS Seatbelt 和 Linux bubblewrap adapter。
-- 明确的 read/write/network capability model。
-- context window 预算、tool output 截断和 compaction。
-- git diff 展示、回滚点与变更摘要。
-- app-server 的最小双向协议，支持 UI 回答 approvals。
+在扩展功能的同时，按 `research/06-agent-acceptance.md` 进行真实模型冒烟和多任务评估。当前确定性测试不代表已经测得云端模型成功率。
 
-## Phase 3：Claude-compatible profile
-
-- `provider-anthropic`：Messages streaming、thinking/text/tool_use/tool_result 映射。
-- `CLAUDE.md` 的发现、继承和优先级。
-- Claude 风格工具名和权限模式。
-- hooks 与 skills 的兼容格式。
-- subagent、MCP、非交互 JSON 输出。
-
-这里应共享 kernel 事件，不让 OpenAI 或 Anthropic 的 wire types 渗透到 tool runtime 和 store。
-
-## 暂不进入 MVP 的功能
-
-- 完整 TUI 和 IDE extension。
-- 云端 task service、远程环境和账户同步。
-- 多 agent 编排、实时语音、浏览器控制。
-- plugin marketplace 和 MCP App UI。
-- 与任一产品所有历史命令的逐项兼容。
-
-## 下一次讨论需要拍板的事项
-
-1. 是以官方 Codex fork 为长期产品，还是仅作参考、自己实现较小内核。
-2. MVP 首个平台：只支持 macOS，还是同时支持 Linux。
-3. 首个可用界面：非交互 CLI，还是一开始就做 TUI。
-4. Claude profile 的目标：生态配置兼容，还是 CLI 命令也要求兼容。
-5. 是否允许第一阶段使用 OpenAI/Anthropic 官方云 API；本地模型支持可以后置。
+Linux sandbox、TUI / IDE、云端执行、多 agent 编排和账户同步均不属于已完成范围。先以 CLI 和稳定 JSONL 协议支持受监督使用，再根据真实任务失败样本确定优先级。

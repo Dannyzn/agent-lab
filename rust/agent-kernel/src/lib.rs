@@ -1,5 +1,9 @@
-use agent_protocol::{BoxError, EventSink, ModelClient, ToolCall, event};
-use agent_tools::ToolRegistry;
+use agent_policy::{ApprovalMode, PolicyDecision};
+use agent_protocol::{
+    ApprovalDecision, ApprovalHandler, ApprovalRequest, BoxError, CancellationToken, EventSink,
+    ModelClient, ToolCall, event,
+};
+use agent_tools::{ToolRegistry, ToolResult};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -10,6 +14,9 @@ pub struct Agent {
     tools: ToolRegistry,
     events: Arc<dyn EventSink>,
     max_steps: usize,
+    approval_mode: ApprovalMode,
+    approvals: Option<Arc<dyn ApprovalHandler>>,
+    cancellation: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -30,11 +37,29 @@ impl Agent {
             tools,
             events,
             max_steps: 16,
+            approval_mode: ApprovalMode::Ask,
+            approvals: None,
+            cancellation: CancellationToken::default(),
         }
     }
 
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps;
+        self
+    }
+
+    pub fn with_approvals(
+        mut self,
+        mode: ApprovalMode,
+        handler: Option<Arc<dyn ApprovalHandler>>,
+    ) -> Self {
+        self.approval_mode = mode;
+        self.approvals = handler;
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
         self
     }
 
@@ -47,7 +72,7 @@ impl Agent {
             json!({"thread_id":thread_id,"turn_id":turn_id}),
         )?;
         match self.run_turn(prompt, &thread_id, &turn_id).await {
-            Ok(final_message) => {
+            Ok(final_message) if !self.cancellation.is_cancelled() => {
                 self.emit(
                     "turn.completed",
                     json!({"thread_id":thread_id,"turn_id":turn_id}),
@@ -58,7 +83,15 @@ impl Agent {
                     final_message,
                 })
             }
-            Err(error) => {
+            result => {
+                if self.cancellation.is_cancelled() {
+                    self.emit(
+                        "turn.cancelled",
+                        json!({"thread_id":thread_id,"turn_id":turn_id}),
+                    )?;
+                    return Err(anyhow!("turn cancelled"));
+                }
+                let error = result.expect_err("successful result handled above");
                 let failure = self.emit(
                     "turn.failed",
                     json!({
@@ -85,13 +118,14 @@ impl Agent {
         })];
         let tool_specs = self.tools.specs();
         for _ in 0..self.max_steps {
-            let response = self
-                .model
-                .complete(&history, &tool_specs)
-                .await
-                .map_err(boxed_error)?;
+            let response = tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return Err(anyhow!("turn cancelled")),
+                response = self.model.complete(&history, &tool_specs) => response.map_err(boxed_error)?,
+            };
             if !response.tool_calls.is_empty() {
                 for call in response.tool_calls {
+                    anyhow::ensure!(!self.cancellation.is_cancelled(), "turn cancelled");
                     history.push(json!({
                         "type":"function_call",
                         "call_id":call.call_id,
@@ -135,7 +169,59 @@ impl Agent {
             "item.started",
             json!({"thread_id":thread_id,"turn_id":turn_id,"item":item}),
         )?;
-        let result = self.tools.execute(&call.name, &call.arguments).await;
+        let mut approval_error = None;
+        let result = match self
+            .tools
+            .decision(&call.name, &call.arguments, self.approval_mode)
+        {
+            PolicyDecision::Deny(reason) => ToolResult::error(format!("policy denied: {reason}")),
+            PolicyDecision::Allow => {
+                self.tools
+                    .execute_cancellable(&call.name, &call.arguments, &self.cancellation)
+                    .await
+            }
+            PolicyDecision::Ask(reason) => {
+                let request = ApprovalRequest {
+                    approval_id: Uuid::new_v4().to_string(),
+                    thread_id: thread_id.into(),
+                    turn_id: turn_id.into(),
+                    call_id: call.call_id.clone(),
+                    tool: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    reason,
+                    capabilities: self.tools.capabilities(),
+                };
+                self.emit("approval.requested", serde_json::to_value(&request)?)?;
+                let decision = match &self.approvals {
+                    Some(handler) => tokio::select! {
+                        biased;
+                        _ = self.cancellation.cancelled() => {
+                            self.emit("approval.resolved", json!({"thread_id":thread_id,"turn_id":turn_id,"approval_id":request.approval_id,"decision":"cancelled"}))?;
+                            None
+                        },
+                        decision = handler.approve(&request) => Some(match decision {
+                            Ok(decision) => decision,
+                            Err(error) => { approval_error = Some(error.to_string()); ApprovalDecision::Deny }
+                        }),
+                    },
+                    None => Some(ApprovalDecision::Deny),
+                };
+                if let Some(decision) = decision {
+                    self.emit("approval.resolved", json!({"thread_id":thread_id,"turn_id":turn_id,"approval_id":request.approval_id,"decision":decision,"error":approval_error}))?;
+                }
+                if decision == Some(ApprovalDecision::Allow) && !self.cancellation.is_cancelled() {
+                    self.tools
+                        .execute_cancellable(&call.name, &call.arguments, &self.cancellation)
+                        .await
+                } else {
+                    ToolResult::error(if decision.is_none() {
+                        "approval cancelled"
+                    } else {
+                        "approval denied"
+                    })
+                }
+            }
+        };
         self.emit(
             "item.completed",
             json!({
@@ -146,11 +232,14 @@ impl Agent {
                     "type":item_type,
                     "name":call.name,
                     "arguments":call.arguments,
-                    "status":if result.success {"completed"} else {"failed"},
+                    "status":if self.cancellation.is_cancelled() {"cancelled"} else if result.success {"completed"} else {"failed"},
                     "result":result
                 }
             }),
         )?;
+        if let Some(error) = approval_error {
+            return Err(anyhow!(error));
+        }
         Ok(json!({
             "type":"function_call_output",
             "call_id":call.call_id,
@@ -234,8 +323,9 @@ mod tests {
         });
         let events = Arc::new(MemoryEventSink::default());
         let policy = WorkspacePolicy::new(temporary.path()).unwrap();
-        let tools = ToolRegistry::new(policy, CommandExecutor);
-        let agent = Agent::new(model.clone(), tools, events.clone());
+        let tools = ToolRegistry::new(policy, CommandExecutor::default());
+        let agent = Agent::new(model.clone(), tools, events.clone())
+            .with_approvals(ApprovalMode::Auto, None);
 
         let result = agent.run(&contract.prompt).await.unwrap();
 
@@ -263,6 +353,179 @@ mod tests {
             histories.iter().map(Vec::len).collect::<Vec<_>>(),
             contract.expected.history_lengths
         );
+    }
+
+    struct FixedApproval(ApprovalDecision);
+    #[async_trait]
+    impl ApprovalHandler for FixedApproval {
+        async fn approve(&self, _request: &ApprovalRequest) -> Result<ApprovalDecision, BoxError> {
+            Ok(self.0)
+        }
+    }
+
+    struct PendingApproval;
+    #[async_trait]
+    impl ApprovalHandler for PendingApproval {
+        async fn approve(&self, _request: &ApprovalRequest) -> Result<ApprovalDecision, BoxError> {
+            std::future::pending().await
+        }
+    }
+
+    struct PendingModel;
+    #[async_trait]
+    impl ModelClient for PendingModel {
+        async fn complete(&self, _: &[Value], _: &[Value]) -> Result<ModelResponse, BoxError> {
+            std::future::pending().await
+        }
+    }
+
+    fn patch_model() -> Arc<ScriptedModel> {
+        Arc::new(ScriptedModel {
+            responses: Mutex::new(vec![ModelResponse {
+                tool_calls: vec![ToolCall { call_id: "patch-1".into(), name: "apply_patch".into(), arguments: json!({"patch":"*** Begin Patch\n*** Update File: value.txt\n@@\n-old\n+new\n*** End Patch"}) }], ..Default::default()
+            }, ModelResponse { text: Some("done".into()), ..Default::default() }].into_iter()),
+            histories: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn approval_is_once_per_call_and_denial_returns_to_model() {
+        for decision in [ApprovalDecision::Allow, ApprovalDecision::Deny] {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(root.path().join("value.txt"), "old\n").unwrap();
+            let model = patch_model();
+            let events = Arc::new(MemoryEventSink::default());
+            let tools = ToolRegistry::new(
+                WorkspacePolicy::new(root.path()).unwrap(),
+                CommandExecutor::default(),
+            );
+            let agent = Agent::new(model.clone(), tools, events.clone())
+                .with_approvals(ApprovalMode::Ask, Some(Arc::new(FixedApproval(decision))));
+            agent.run("change value").await.unwrap();
+            assert_eq!(
+                fs::read_to_string(root.path().join("value.txt")).unwrap(),
+                if decision == ApprovalDecision::Allow {
+                    "new\n"
+                } else {
+                    "old\n"
+                }
+            );
+            let recorded = events.events();
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|e| e["type"] == "approval.requested")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|e| e["type"] == "approval.resolved")
+                    .count(),
+                1
+            );
+            let histories = model.histories.lock().unwrap();
+            assert_eq!(histories[1].len(), 3);
+            let output: Value =
+                serde_json::from_str(histories[1][2]["output"].as_str().unwrap()).unwrap();
+            assert_eq!(output["success"], decision == ApprovalDecision::Allow);
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_cannot_be_overridden_by_auto_approval() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("value.txt"), "old\n").unwrap();
+        let events = Arc::new(MemoryEventSink::default());
+        let tools = ToolRegistry::new(
+            WorkspacePolicy::new(root.path())
+                .unwrap()
+                .with_read_only(true),
+            CommandExecutor::default(),
+        );
+        Agent::new(patch_model(), tools, events.clone())
+            .with_approvals(ApprovalMode::Auto, None)
+            .run("change")
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("value.txt")).unwrap(),
+            "old\n"
+        );
+        assert!(
+            !events
+                .events()
+                .iter()
+                .any(|e| e["type"] == "approval.requested")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_sampling_or_awaiting_approval_is_terminal() {
+        for awaiting in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(root.path().join("value.txt"), "old\n").unwrap();
+            let events = Arc::new(MemoryEventSink::default());
+            let cancellation = CancellationToken::default();
+            let model: Arc<dyn ModelClient> = if awaiting {
+                patch_model()
+            } else {
+                Arc::new(PendingModel)
+            };
+            let tools = ToolRegistry::new(
+                WorkspacePolicy::new(root.path()).unwrap(),
+                CommandExecutor::default(),
+            );
+            let agent = Agent::new(model, tools, events.clone())
+                .with_approvals(ApprovalMode::Ask, Some(Arc::new(PendingApproval)))
+                .with_cancellation(cancellation.clone());
+            let task = tokio::spawn(async move { agent.run("change").await });
+            for _ in 0..100 {
+                if events.events().iter().any(|e| {
+                    e["type"]
+                        == if awaiting {
+                            "approval.requested"
+                        } else {
+                            "turn.started"
+                        }
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            cancellation.cancel();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            let recorded = events.events();
+            assert_eq!(recorded.last().unwrap()["type"], "turn.cancelled");
+            assert!(
+                !recorded
+                    .iter()
+                    .any(|e| e["type"] == "turn.completed" || e["type"] == "turn.failed")
+            );
+            assert_eq!(
+                fs::read_to_string(root.path().join("value.txt")).unwrap(),
+                "old\n"
+            );
+            if awaiting {
+                assert!(
+                    recorded
+                        .iter()
+                        .any(|e| e["type"] == "approval.resolved" && e["decision"] == "cancelled")
+                );
+                assert!(
+                    recorded.iter().any(
+                        |e| e["type"] == "item.completed" && e["item"]["status"] == "cancelled"
+                    )
+                );
+            }
+        }
     }
 
     fn contract_dir() -> PathBuf {

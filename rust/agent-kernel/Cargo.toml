@@ -5,10 +5,12 @@ edition.workspace = true
 
 [dependencies]
 agent-protocol.workspace = true
+agent-policy.workspace = true
 agent-tools.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 agent-exec.workspace = true

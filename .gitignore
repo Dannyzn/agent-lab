@@ -24,3 +24,12 @@ target/
 .DS_Store
 .idea/
 .vscode/
+
+# Python interpreter cache
+__pycache__/
+*.py[cod]
+
+# Private provider profiles, launchers and live-provider experiments
+/configs/providers/
+/experiments/*-live/
+/scripts/run-provider.py

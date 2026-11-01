@@ -14,6 +14,8 @@ pub struct OpenAIResponsesClient {
     api_key: String,
     model: String,
     instructions: String,
+    max_output_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAIResponsesClient {
@@ -27,17 +29,46 @@ impl OpenAIResponsesClient {
             return Err(anyhow!("OPENAI_API_KEY is required").into());
         }
         Ok(Self {
-            client: reqwest::Client::builder().build()?,
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(120))
+                .build()?,
             url: format!("{}/responses", base_url.as_ref().trim_end_matches('/')),
             api_key,
             model: model.into(),
             instructions: DEFAULT_INSTRUCTIONS.into(),
+            max_output_tokens: None,
+            reasoning_effort: None,
         })
     }
 
     pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = instructions.into();
         self
+    }
+
+    pub fn with_generation_options(
+        mut self,
+        max_output_tokens: Option<u32>,
+        reasoning_effort: Option<String>,
+    ) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    fn request_body(&self, input_history: &[Value], tool_specs: &[Value]) -> Value {
+        let mut body = json!({
+            "model":self.model, "instructions":self.instructions,
+            "input":input_history, "tools":tool_specs, "stream":true
+        });
+        if let Some(limit) = self.max_output_tokens {
+            body["max_output_tokens"] = json!(limit);
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning"] = json!({"effort":effort});
+        }
+        body
     }
 
     async fn complete_once(
@@ -49,20 +80,17 @@ impl OpenAIResponsesClient {
             .client
             .post(&self.url)
             .bearer_auth(&self.api_key)
-            .json(&json!({
-                "model":self.model,
-                "instructions":self.instructions,
-                "input":input_history,
-                "tools":tool_specs,
-                "stream":true
-            }))
+            .json(&self.request_body(input_history, tool_specs))
             .send()
             .await
             .map_err(|error| RequestError::retryable(error.to_string()))?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            let message = format!("Responses API returned {status}: {body}");
+            let message = format!(
+                "Responses API returned {status}: {}",
+                body.replace(&self.api_key, "[REDACTED]")
+            );
             return Err(RequestError {
                 retryable: status.as_u16() == 429 || status.is_server_error(),
                 message,
@@ -70,27 +98,43 @@ impl OpenAIResponsesClient {
         }
 
         let mut parsed = ModelResponse::default();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| RequestError::retryable(error.to_string()))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            if buffer.contains("\r\n") {
-                buffer = buffer.replace("\r\n", "\n");
-            }
-            while let Some(boundary) = buffer.find("\n\n") {
-                let frame = buffer[..boundary].to_owned();
-                buffer.drain(..boundary + 2);
+            buffer.extend_from_slice(&chunk);
+            while let Some((boundary, delimiter)) = frame_boundary(&buffer) {
+                let frame = String::from_utf8(buffer.drain(..boundary + delimiter).collect())
+                    .map_err(|error| RequestError::retryable(error.to_string()))?;
                 parse_sse_frame(&frame, &mut parsed)
                     .map_err(|error| RequestError::retryable(error.to_string()))?;
             }
         }
-        if !buffer.trim().is_empty() {
-            parse_sse_frame(&buffer, &mut parsed)
+        if !buffer.is_empty() {
+            let frame = String::from_utf8(buffer)
                 .map_err(|error| RequestError::retryable(error.to_string()))?;
+            parse_sse_frame(&frame, &mut parsed)
+                .map_err(|error| RequestError::retryable(error.to_string()))?;
+        }
+        if parsed.response_id.is_none() {
+            return Err(RequestError::retryable(
+                "Responses stream ended without response.completed".into(),
+            ));
         }
         Ok(parsed)
     }
+}
+
+fn frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    (0..buffer.len()).find_map(|offset| {
+        if buffer[offset..].starts_with(b"\n\n") {
+            Some((offset, 2))
+        } else if buffer[offset..].starts_with(b"\r\n\r\n") {
+            Some((offset, 4))
+        } else {
+            None
+        }
+    })
 }
 
 #[async_trait]
@@ -178,7 +222,7 @@ fn parse_sse_frame(frame: &str, response: &mut ModelResponse) -> Result<(), BoxE
                 .and_then(Value::as_str)
                 .map(str::to_owned);
         }
-        Some("error") => {
+        Some("error" | "response.failed" | "response.incomplete") => {
             return Err(anyhow!("Responses stream error: {event}").into());
         }
         _ => {}
@@ -213,5 +257,39 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
         .unwrap();
         assert_eq!(response.tool_calls[0].name, "read_file");
         assert_eq!(response.text.as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn generation_options_are_explicit() {
+        let client =
+            OpenAIResponsesClient::new("test-model", "test-key", "https://provider.example/v1")
+                .unwrap()
+                .with_generation_options(Some(2048), Some("none".into()));
+        let body = client.request_body(&[], &[]);
+        assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["reasoning"]["effort"], "none");
+        assert_eq!(client.url, "https://provider.example/v1/responses");
+    }
+
+    #[test]
+    fn rejects_unsuccessful_terminal_events_and_handles_utf8_frames() {
+        for kind in ["response.failed", "response.incomplete"] {
+            let mut parsed = ModelResponse::default();
+            assert!(
+                parse_sse_frame(&format!("data: {{\"type\":\"{kind}\"}}"), &mut parsed).is_err()
+            );
+        }
+        let frame = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"修复完成\"}]}}\r\n\r\n";
+        let mut buffer = Vec::new();
+        let mut parsed = ModelResponse::default();
+        for byte in frame.as_bytes() {
+            buffer.push(*byte);
+            if let Some((boundary, length)) = frame_boundary(&buffer) {
+                let complete =
+                    String::from_utf8(buffer.drain(..boundary + length).collect()).unwrap();
+                parse_sse_frame(&complete, &mut parsed).unwrap();
+            }
+        }
+        assert_eq!(parsed.text.as_deref(), Some("修复完成"));
     }
 }
