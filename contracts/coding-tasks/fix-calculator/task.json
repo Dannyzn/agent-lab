@@ -1,0 +1,8 @@
+{
+  "id": "fix-calculator",
+  "prompt": "Run the existing tests to reproduce the bug, inspect the implementation, fix the implementation with the smallest change, and rerun the tests. Only calculator.py may be modified. Never patch or write test files, including no-op patches. Commands must use argv without a shell. apply_patch accepts *** Begin Patch / *** Update File: relative/path / @@ / context, -old and +new lines / *** End Patch.",
+  "editable_files": ["calculator.py"],
+  "required_changed_files": ["calculator.py"],
+  "test_argv": ["python3", "-B", "-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"],
+  "initial_tests_should_pass": false
+}

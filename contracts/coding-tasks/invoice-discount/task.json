@@ -1,0 +1,8 @@
+{
+  "id": "invoice-discount",
+  "prompt": "Implement the invoice discount feature across the pricing, service and CLI modules, preserving default behavior. calculate_total(prices, discount_percent=0) must return integer cents, computed as sum(prices) * (100 - discount_percent) // 100, and reject discount percentages outside 0..100 with ValueError. create_quote(prices, discount_percent=0) must forward the discount and return subtotal_cents, discount_cents (subtotal minus discounted total), and total_cents. The CLI must accept --discount-percent as an integer, default 0, and pass it through service to pricing; invalid values must exit nonzero. Run the existing tests before and after. Only invoice/pricing.py, invoice/service.py and invoice/cli.py may change, and each needs its appropriate implementation. Do not edit tests or other files, even with no-op patches. You may use only existing UTF-8 files. Use argv commands without shell. apply_patch format: *** Begin Patch, *** Update File: relative/path, @@, context/-old/+new lines, *** End Patch.",
+  "editable_files": ["invoice/pricing.py", "invoice/service.py", "invoice/cli.py"],
+  "required_changed_files": ["invoice/pricing.py", "invoice/service.py", "invoice/cli.py"],
+  "test_argv": ["python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"],
+  "initial_tests_should_pass": false
+}

@@ -40,5 +40,6 @@
 - [Phase 2 实验与验收](experiments/phase2/README.md)
 - [Phase 2 结果和限制](experiments/phase2/RESULT.md)
 - [如何判断 agent 可用：测试指南](research/06-agent-acceptance.md)
+- [单文件修复与多文件任务验收](experiments/agent-eval/RESULT.md)
 
-Phase 2 验证的是运行时与边界。另已完成真实模型的小样本功能验收，但样本量不足以推断通用任务可靠性。具体供应商配置、模型标识、网关地址和原始实测记录仅保留在本地，不纳入版本控制。恢复、compaction 和 Anthropic profile 仍为后续阶段。
+Phase 2 验证的是运行时与边界。另已完成真实模型的单文件修复和三文件功能任务验收：外部测试通过、保护文件未变，且无被拒绝的审批请求；样本量仍不足以推断通用任务可靠性。具体供应商配置、模型标识、网关地址和原始实测记录仅保留在本地，不纳入版本控制。恢复、compaction 和 Anthropic profile 仍为后续阶段。
